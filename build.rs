@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     // Source path: ../out_lib/fpcalc.exe relative to the crate root
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let source_path = Path::new(&manifest_dir).join("../out_lib/fpcalc.exe");
+    let source_path = Path::new(&manifest_dir).join("./out_lib/fpcalc.exe");
 
     println!("cargo:rerun-if-changed={}", source_path.display());
 
