@@ -31,6 +31,13 @@ pub const HTML_CONTENT: &str = r#"
                     :class="activeTab === 'duplicates' ? 'bg-indigo-100 text-indigo-700' : 'text-gray-600 hover:bg-gray-50'">
                     Duplicates ({{ duplicateGroups.length }})
                 </button>
+                <a 
+                    href="/playlist.m3u"
+                    target="_blank" 
+                    title="Download M3U Playlist (DMC)"
+                    class="px-4 py-2 rounded font-medium text-gray-600 hover:bg-gray-50 flex items-center transition-colors">
+                    Playlist
+                </a>
                 <div class="border-l pl-4"></div>
                 <button 
                     @click="startScan" 

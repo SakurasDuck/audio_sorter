@@ -24,6 +24,7 @@ tower-http = { version = "0.6.8", features = ["fs", "trace", "cors"] }
 sysinfo = "0.30"
 dashmap = "5.5"
 tokio-stream = "0.1"
+urlencoding = "2.1"
 
 [profile.release]
 opt-level = 3

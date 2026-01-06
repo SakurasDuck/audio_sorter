@@ -1,3 +1,4 @@
+use axum::http::HeaderMap;
 use axum::{
     extract::{self, Query, State},
     response::{Html, IntoResponse, Json},
@@ -9,6 +10,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tower_http::services::ServeDir;
 
 use crate::html_template::HTML_CONTENT;
 use crate::scan_manager::ScanManager;
@@ -37,7 +39,7 @@ pub async fn start_server(index_dir: PathBuf, input_dir: Option<PathBuf>, port: 
 
     let state = Arc::new(AppState {
         index_path,
-        input_dir,
+        input_dir: input_dir.clone(),
         scan_manager,
     });
 
@@ -48,13 +50,101 @@ pub async fn start_server(index_dir: PathBuf, input_dir: Option<PathBuf>, port: 
         .route("/api/scan/status", get(get_scan_status))
         .route("/api/duplicates", get(get_duplicates))
         .route("/api/recommend", get(get_recommendations))
-        .with_state(state);
+        .route("/playlist.m3u", get(get_playlist));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    println!("Web Dashboard available at http://{}", addr);
+    let app = if let Some(dir) = input_dir {
+        app.nest_service("/stream", ServeDir::new(dir))
+    } else {
+        app
+    };
+
+    let app = app.with_state(state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    println!("Web Dashboard available at http://{}:{}", "127.0.0.1", port);
+    println!(
+        "Playlist available at http://{}:{}/playlist.m3u",
+        "127.0.0.1", port
+    );
 
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn get_playlist(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("127.0.0.1");
+
+    let lib = match AudioLibrary::load(&state.index_path) {
+        Ok(l) => l,
+        Err(_) => {
+            return (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "audio/x-mpegurl; charset=utf-8",
+                )],
+                "#EXTM3U\n# Error: Could not load library".to_string(),
+            );
+        }
+    };
+
+    let mut m3u = String::from("#EXTM3U\n");
+
+    // We need to map file paths to relative paths from the served root.
+    // However, AudioLibrary stores absolute paths.
+    // If input_dir is set, we can strip the prefix.
+
+    if let Some(root) = &state.input_dir {
+        for (path, track) in &lib.files {
+            if let Ok(relative) = path.strip_prefix(root) {
+                // Determine duration in seconds (integer)
+                let duration_secs = track.metadata.duration.round() as i64;
+
+                // Get display title
+                let title = if track.metadata.title.is_empty() {
+                    "Unknown Title"
+                } else {
+                    &track.metadata.title
+                };
+                let artist = if track.metadata.artist.is_empty() {
+                    "Unknown Artist"
+                } else {
+                    &track.metadata.artist
+                };
+
+                // EXTINF:duration,Artist - Title
+                m3u.push_str(&format!(
+                    "#EXTINF:{},{} - {}\n",
+                    duration_secs, artist, title
+                ));
+
+                // URL: http://<host>/stream/<relative_path>
+                // Encode each path segment separately to handle spaces, Chinese chars, etc.
+                let url_path: String = relative
+                    .iter()
+                    .map(|seg| urlencoding::encode(&seg.to_string_lossy()).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+
+                let full_url = format!("http://{}/stream/{}", host, url_path);
+                m3u.push_str(&full_url);
+                m3u.push('\n');
+            }
+        }
+    } else {
+        m3u.push_str("# Error: No input directory configured, cannot serve files.");
+    }
+
+    // Return with proper Content-Type for M3U playlist
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "audio/x-mpegurl; charset=utf-8",
+        )],
+        m3u,
+    )
 }
 
 async fn serve_index() -> Html<&'static str> {
