@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use crate::acoustid;
+use crate::audio_decoder;
 use crate::fingerprint;
 use crate::musicbrainz;
 use crate::organizer::{self, TrackMetadata};
 use crate::ScanArgs;
 
-// Import decoder trait and implementation
+// Import decoder trait and implementation for bliss analysis
 use bliss_audio::decoder::symphonia::SymphoniaDecoder;
 use bliss_audio::decoder::Decoder as DecoderTrait;
 
@@ -16,10 +17,16 @@ pub fn process_file(
     args: &ScanArgs,
     client: &reqwest::blocking::Client,
 ) -> Result<(TrackMetadata, Option<Vec<f32>>)> {
-    // Always compute fingerprint and duration
-    let (duration, fp) =
-        fingerprint::compute_fingerprint(path).context("Fingerprint generation failed")?;
+    // Decode audio once using our unified decoder
+    let decoded = audio_decoder::decode_audio(path).context("Failed to decode audio file")?;
 
+    // Compute fingerprint from decoded samples (no re-reading file)
+    let fp = fingerprint::compute_fingerprint_from_decoded(&decoded)
+        .context("Fingerprint generation failed")?;
+
+    let duration = decoded.duration_secs;
+
+    // Build metadata
     let meta = if args.offline || args.client_id.is_none() {
         let mut meta = organizer::read_tags(path).context("Failed to read local tags")?;
         meta.duration = duration;
@@ -37,12 +44,61 @@ pub fn process_file(
         }
     };
 
-    // Melody Analysis (Bliss) using Symphonia decoder
+    // Melody Analysis (Bliss) - still uses its own decoder for now
+    // TODO: In future, could modify bliss to accept pre-decoded samples
     let analysis = match SymphoniaDecoder::song_from_path(path) {
         Ok(song) => {
             // Convert Analysis to Vec<f32>
             Some(song.analysis.as_vec())
         }
+        Err(_e) => None,
+    };
+
+    Ok((meta, analysis))
+}
+
+/// Process audio file from pre-loaded memory buffer
+/// This avoids disk I/O during parallel processing phase
+pub fn process_file_from_memory(
+    path: &Path,
+    file_data: Vec<u8>,
+    args: &ScanArgs,
+    client: &reqwest::blocking::Client,
+) -> Result<(TrackMetadata, Option<Vec<f32>>)> {
+    // Decode audio from memory buffer (clone data since we need it for both decode and tags)
+    let decoded = audio_decoder::decode_audio_from_memory(file_data.clone(), path)
+        .context("Failed to decode audio from memory")?;
+
+    // Compute fingerprint from decoded samples
+    let fp = fingerprint::compute_fingerprint_from_decoded(&decoded)
+        .context("Fingerprint generation failed")?;
+
+    let duration = decoded.duration_secs;
+
+    // Build metadata - now from memory!
+    let meta = if args.offline || args.client_id.is_none() {
+        let mut meta = organizer::read_tags_from_memory(&file_data, path)
+            .unwrap_or_else(|_| organizer::TrackMetadata::default());
+        meta.duration = duration;
+        meta.fingerprint = Some(fp.clone());
+        meta
+    } else {
+        match perform_online_lookup(args, client, duration, &fp) {
+            Ok(meta) => meta,
+            Err(_e) => {
+                let mut meta = organizer::read_tags_from_memory(&file_data, path)
+                    .unwrap_or_else(|_| organizer::TrackMetadata::default());
+                meta.duration = duration;
+                meta.fingerprint = Some(fp.clone());
+                meta
+            }
+        }
+    };
+
+    // Melody Analysis (Bliss) - now from memory using Song::analyze
+    let bliss_samples = decoded.to_bliss_samples();
+    let analysis = match bliss_audio::Song::analyze(&bliss_samples) {
+        Ok(bliss_analysis) => Some(bliss_analysis.as_vec()),
         Err(_e) => None,
     };
 

@@ -1,11 +1,59 @@
 use crate::storage::{AudioLibrary, IndexedTrack};
 use crate::TrackMetadata;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rayon::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, System};
+
+/// Detect if the given path is likely on an SSD.
+/// Returns true if SSD, false if HDD or unknown.
+///
+/// On Windows, this uses disk information to make an educated guess.
+/// For SATA drives, we assume HDD unless proven otherwise.
+fn detect_disk_type(path: &std::path::Path) -> bool {
+    // Get the disk info for the path
+    let disks = Disks::new_with_refreshed_list();
+
+    // Find the disk containing this path
+    let disk = disks
+        .iter()
+        .filter(|d| path.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len());
+
+    if let Some(disk) = disk {
+        // Check disk name for SSD indicators
+        let name = disk.name().to_string_lossy().to_lowercase();
+        let kind_str = format!("{:?}", disk.kind()).to_lowercase();
+
+        // NVMe drives are always SSD
+        if name.contains("nvme") || kind_str.contains("nvme") {
+            return true;
+        }
+
+        // Look for SSD keywords in disk name
+        if name.contains("ssd") || name.contains("solid") {
+            return true;
+        }
+
+        // Check if it's marked as removable (USB drives vary, but often slower)
+        if disk.is_removable() {
+            return false;
+        }
+
+        // On Windows, check the disk kind
+        // sysinfo::DiskKind::SSD is available on some systems
+        match disk.kind() {
+            sysinfo::DiskKind::SSD => return true,
+            sysinfo::DiskKind::HDD => return false,
+            _ => {}
+        }
+    }
+
+    // Default: assume HDD (conservative choice for better reliability)
+    false
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResourceStats {
@@ -239,41 +287,84 @@ impl ScanManager {
             return Ok(());
         }
 
-        // 4. Process Phase (Parallel)
-        // 4. Process Phase (Batched Parallelism)
-        let batch_size = 50;
+        // 4. Process Phase (Memory-Aware Batched Parallelism)
         let mut processed_c = skipped_count;
         let mut error_c = 0;
 
-        // Configure Rayon thread pool to limit concurrency
-        // Use logical cores - 1, minimum 1 to prevent UI freeze
-        let num_threads = std::cmp::max(
-            1,
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(2)
-                .saturating_sub(1),
-        );
-        // Also cap at 4 to prevent disk thrashing (high I/O latency)
-        let num_threads = std::cmp::min(num_threads, 4);
+        // Configure Rayon thread pool based on disk type
+        let is_likely_ssd = detect_disk_type(&input_dir);
+        let base_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .saturating_sub(1)
+            .max(1);
+
+        let num_threads = if is_likely_ssd {
+            std::cmp::min(base_threads, 4)
+        } else {
+            std::cmp::min(base_threads, 2)
+        };
+
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
             .unwrap();
 
+        // Memory-aware batch sizing
+        // Use up to 50% of available memory for preloading
+        let mut sys = System::new_all();
+        sys.refresh_memory();
+        let available_memory = sys.available_memory(); // in bytes
+        let memory_budget = (available_memory as f64 * 0.5) as u64; // Use 50% of available
+
         pool.install(|| {
-            for chunk in files_to_process.chunks(batch_size) {
-                // Process chunk in parallel
+            let mut batch_start = 0;
+
+            while batch_start < files_to_process.len() {
+                // Calculate how many files we can preload within memory budget
+                let mut batch_end = batch_start;
+                let mut batch_memory = 0u64;
+
+                while batch_end < files_to_process.len() {
+                    let file_size = files_to_process[batch_end].1;
+                    // Account for file size + decoded PCM (roughly 10x for FLAC)
+                    let estimated_memory = file_size * 12;
+
+                    if batch_memory + estimated_memory > memory_budget && batch_end > batch_start {
+                        break; // Would exceed budget, stop here
+                    }
+
+                    batch_memory += estimated_memory;
+                    batch_end += 1;
+
+                    // Cap batch at 100 files max for progress updates
+                    if batch_end - batch_start >= 100 {
+                        break;
+                    }
+                }
+
+                let chunk = &files_to_process[batch_start..batch_end];
+
+                // PHASE 1: Sequential disk read - preload all files into memory
+                let preloaded: Vec<_> = chunk
+                    .iter()
+                    .map(|(path, size, mtime)| {
+                        let data = std::fs::read(path).ok();
+                        (path.clone(), *size, *mtime, data)
+                    })
+                    .collect();
+
+                // PHASE 2: Parallel CPU processing from memory
                 let chunk_results: Vec<(
                     PathBuf,
                     u64,
                     u64,
                     Result<(TrackMetadata, Option<Vec<f32>>)>,
-                )> = chunk
-                    .par_iter()
+                )> = preloaded
+                    .into_par_iter()
                     .map_init(
                         || reqwest::blocking::Client::new(),
-                        |client, (path, size, mtime)| {
+                        |client, (path, size, mtime, data_opt)| {
                             let args = crate::ScanArgs {
                                 input_dir: input_dir.clone(),
                                 output_dir: index_dir.clone(),
@@ -281,8 +372,12 @@ impl ScanManager {
                                 client_id: client_id.clone(),
                             };
 
-                            let result = crate::worker::process_file(path, &args, client);
-                            (path.clone(), *size, *mtime, result)
+                            let result = if let Some(data) = data_opt {
+                                crate::worker::process_file_from_memory(&path, data, &args, client)
+                            } else {
+                                Err(anyhow::anyhow!("Failed to preload file"))
+                            };
+                            (path, size, mtime, result)
                         },
                     )
                     .collect();
@@ -330,6 +425,9 @@ impl ScanManager {
                     let _ = library.save(&index_path);
                     let _ = analysis_store.save(&analysis_path);
                 }
+
+                // Move to next batch
+                batch_start = batch_end;
             }
         });
 

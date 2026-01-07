@@ -1,11 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod acoustid;
 pub mod analysis_store;
+pub mod audio_decoder;
 pub mod fingerprint;
 pub mod html_template;
 pub mod musicbrainz;
