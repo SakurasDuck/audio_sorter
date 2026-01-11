@@ -63,9 +63,16 @@ pub struct ResourceStats {
     pub disk_total: u64,   // in bytes (total space on target drive)
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub enum TaskType {
+    Scan,
+    Classify,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanProgress {
-    pub is_scanning: bool,
+    pub is_scanning: bool, // Kept for backward compat, true if any task is running
+    pub current_task: Option<TaskType>,
     pub files_total: usize,
     pub files_processed: usize,
     pub current_file: String,
@@ -78,6 +85,7 @@ impl Default for ScanProgress {
     fn default() -> Self {
         Self {
             is_scanning: false,
+            current_task: None,
             files_total: 0,
             files_processed: 0,
             current_file: String::new(),
@@ -119,7 +127,7 @@ impl ScanManager {
 
         // Check if already scanning
         if progress.read().unwrap().is_scanning {
-            return Err(anyhow::anyhow!("Scan already in progress"));
+            return Err(anyhow::anyhow!("Task already in progress"));
         }
 
         // Reset progress
@@ -127,6 +135,7 @@ impl ScanManager {
             let mut p = progress.write().unwrap();
             *p = ScanProgress::default();
             p.is_scanning = true;
+            p.current_task = Some(TaskType::Scan);
         }
 
         let index_dir_clone = index_dir.clone();
@@ -200,6 +209,7 @@ impl ScanManager {
             {
                 let mut p = progress.write().unwrap();
                 p.is_scanning = false;
+                p.current_task = None;
                 p.elapsed_secs = start_time.elapsed().as_secs();
             }
 
@@ -362,24 +372,21 @@ impl ScanManager {
                     Result<(TrackMetadata, Option<Vec<f32>>)>,
                 )> = preloaded
                     .into_par_iter()
-                    .map_init(
-                        || reqwest::blocking::Client::new(),
-                        |client, (path, size, mtime, data_opt)| {
-                            let args = crate::ScanArgs {
-                                input_dir: input_dir.clone(),
-                                output_dir: index_dir.clone(),
-                                offline,
-                                client_id: client_id.clone(),
-                            };
+                    .map(|(path, size, mtime, data_opt)| {
+                        let args = crate::ScanArgs {
+                            input_dir: input_dir.clone(),
+                            output_dir: index_dir.clone(),
+                            offline,
+                            client_id: client_id.clone(),
+                        };
 
-                            let result = if let Some(data) = data_opt {
-                                crate::worker::process_file_from_memory(&path, data, &args, client)
-                            } else {
-                                Err(anyhow::anyhow!("Failed to preload file"))
-                            };
-                            (path, size, mtime, result)
-                        },
-                    )
+                        let result = if let Some(data) = data_opt {
+                            crate::worker::process_file_from_memory(&path, data, &args)
+                        } else {
+                            Err(anyhow::anyhow!("Failed to preload file"))
+                        };
+                        (path, size, mtime, result)
+                    })
                     .collect();
 
                 // Merge results (Single-threaded to avoid lock contention on library/store)
@@ -434,6 +441,211 @@ impl ScanManager {
         // 6. Save Index
         library.save(&index_path)?;
         analysis_store.save(&analysis_path)?;
+
+        Ok(())
+    }
+    pub fn start_classify(&self, index_dir: PathBuf, model_dir: PathBuf) -> Result<()> {
+        let progress = self.progress.clone();
+
+        // Check if already running
+        if progress.read().unwrap().is_scanning {
+            return Err(anyhow::anyhow!("Task already in progress"));
+        }
+
+        // Reset progress
+        {
+            let mut p = progress.write().unwrap();
+            *p = ScanProgress::default();
+            p.is_scanning = true;
+            p.current_task = Some(TaskType::Classify);
+        }
+
+        let index_dir_clone = index_dir.clone();
+        tokio::spawn(async move {
+            let start_time = Instant::now();
+            let progress_for_monitor = progress.clone();
+            let monitor_index_dir = index_dir_clone.clone();
+
+            // Reuse resource monitor logic (could be refactored into helper)
+            let monitor_handle = std::thread::spawn(move || {
+                let mut sys = System::new_all();
+                sys.refresh_all();
+                let mut disk_usage = 0u64;
+                let mut disk_total = 0u64;
+                let mut disk_refresh_counter = 0u32;
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let is_scanning = match progress_for_monitor.try_read() {
+                        Ok(p) => p.is_scanning,
+                        Err(_) => true,
+                    };
+                    if !is_scanning {
+                        break;
+                    }
+                    sys.refresh_cpu_usage();
+                    sys.refresh_memory();
+                    let cpu_usage = sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>()
+                        / sys.cpus().len().max(1) as f32;
+                    disk_refresh_counter += 1;
+                    if disk_refresh_counter >= 10 {
+                        disk_refresh_counter = 0;
+                        let disks = Disks::new_with_refreshed_list();
+                        if let Some(d) = disks
+                            .iter()
+                            .find(|d| monitor_index_dir.starts_with(d.mount_point()))
+                        {
+                            disk_usage = d.total_space() - d.available_space();
+                            disk_total = d.total_space();
+                        }
+                    }
+                    if let Ok(mut p) = progress_for_monitor.try_write() {
+                        p.elapsed_secs = start_time.elapsed().as_secs();
+                        p.resources.cpu_usage = cpu_usage;
+                        p.resources.memory_usage = sys.used_memory();
+                        p.resources.disk_usage = disk_usage;
+                        p.resources.disk_total = disk_total;
+                    }
+                }
+            });
+
+            let scan_progress = progress.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                Self::run_classify_logic(index_dir, model_dir, scan_progress)
+            })
+            .await;
+
+            // Cleanup
+            {
+                let mut p = progress.write().unwrap();
+                p.is_scanning = false;
+                p.current_task = None;
+                p.elapsed_secs = start_time.elapsed().as_secs();
+            }
+            let _ = monitor_handle.join();
+
+            if let Err(e) = result {
+                eprintln!("Classify task failed: {:?}", e);
+            } else if let Ok(Err(e)) = result {
+                eprintln!("Classify logic failed: {}", e);
+            }
+        });
+
+        Ok(())
+    }
+
+    fn run_classify_logic(
+        index_dir: PathBuf,
+        model_dir: PathBuf,
+        progress: Arc<RwLock<ScanProgress>>,
+    ) -> Result<()> {
+        let index_path = index_dir.join("index.json");
+
+        // 1. Initialize Models
+        crate::genre_classifier::init_models(&model_dir)?;
+
+        // 2. Load Library
+        let mut library = AudioLibrary::load(&index_path).unwrap_or_default();
+
+        // 3. Identify tracks needing classification
+        // We look for tracks that have NO genres or empty genre list
+        // (Assuming we want to re-classify if empty, or just new files)
+        let mut to_process = Vec::new();
+        for (path, track) in &library.files {
+            if track.metadata.genres.is_empty() {
+                to_process.push(path.clone());
+            }
+        }
+
+        {
+            let mut p = progress.write().unwrap();
+            p.files_total = to_process.len();
+        }
+
+        if to_process.is_empty() {
+            return Ok(());
+        }
+
+        // 4. Batch Processing
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .min(4); // Limit threads for inference as it is heavy
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .unwrap();
+
+        let mut processed_c = 0;
+        let mut error_c = 0;
+        let mut batch_start = 0;
+
+        pool.install(|| {
+            while batch_start < to_process.len() {
+                let batch_end = (batch_start + 50).min(to_process.len()); // Batch 50
+                let chunk = &to_process[batch_start..batch_end];
+
+                // Parallel Inference
+                let results: Vec<(PathBuf, Result<Vec<(String, f32)>>)> = chunk
+                    .par_iter()
+                    .map(|path| {
+                        match crate::audio_decoder::decode_audio(path) {
+                            Ok(decoded) => {
+                                // Use 22050Hz mono for bliss/genre as per previous implementation
+                                let bliss_samples = decoded.to_bliss_samples();
+                                match crate::genre_classifier::classify(&bliss_samples, 22050, 3) {
+                                    Ok(genres) => (
+                                        path.clone(),
+                                        Ok(crate::genre_classifier::to_metadata_format(&genres)),
+                                    ),
+                                    Err(e) => (path.clone(), Err(e)),
+                                }
+                            }
+                            Err(e) => (path.clone(), Err(e)),
+                        }
+                    })
+                    .collect();
+
+                // Merge results
+                for (path, res) in results {
+                    processed_c += 1;
+                    match res {
+                        Ok(genres) => {
+                            if let Some(track) = library.files.get_mut(&path) {
+                                track.metadata.genres = genres;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[ERROR] Genre classify failed for {:?}: {}", path, e);
+                            error_c += 1;
+                        }
+                    }
+                }
+
+                // Update Progress
+                if let Ok(mut p) = progress.write() {
+                    p.files_processed = processed_c;
+                    p.errors = error_c;
+                    if let Some(last) = chunk
+                        .last()
+                        .and_then(|p| p.file_name())
+                        .and_then(|s| s.to_str())
+                    {
+                        p.current_file = last.to_string();
+                    }
+                }
+
+                // Save periodically
+                if processed_c % 50 == 0 {
+                    let _ = library.save(&index_path);
+                }
+
+                batch_start = batch_end;
+            }
+        });
+
+        // Final Save
+        library.save(&index_path)?;
 
         Ok(())
     }

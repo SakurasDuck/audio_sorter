@@ -44,7 +44,14 @@ pub const HTML_CONTENT: &str = r#"
                     :disabled="isScanning"
                     class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center">
                     <span v-if="isScanning" class="mr-2 animate-spin">⟳</span>
-                    {{ isScanning ? 'Scanning...' : 'Scan Library' }}
+                    {{ isScanning && (!scanStatus.current_task || scanStatus.current_task === 'Scan') ? 'Scanning...' : 'Scan Library' }}
+                </button>
+                    <button 
+                    @click="startClassify" 
+                    :disabled="isScanning"
+                    class="bg-purple-600 text-white px-4 py-2 rounded hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center ml-2">
+                    <span v-if="isScanning && scanStatus.current_task === 'Classify'" class="mr-2 animate-spin">⟳</span>
+                    {{ isScanning && scanStatus.current_task === 'Classify' ? 'Classifying...' : 'Classify Genres' }}
                 </button>
             </div>
         </header>
@@ -52,7 +59,7 @@ pub const HTML_CONTENT: &str = r#"
         <!-- Scan Status Panel -->
         <div v-if="isScanning || scanStatus.elapsed_secs > 0" class="bg-white p-6 rounded-lg shadow mb-8 border-l-4 border-indigo-500">
             <h2 class="text-lg font-bold mb-4 flex justify-between">
-                <span>Scan Progress</span>
+                <span>{{ scanStatus.current_task === 'Classify' ? 'Classification Progress' : 'Scan Progress' }}</span>
                 <span class="text-sm font-normal text-gray-500">Elapsed: {{ formatTime(scanStatus.elapsed_secs) }}</span>
             </h2>
             
@@ -124,6 +131,7 @@ pub const HTML_CONTENT: &str = r#"
                             <th class="px-5 py-3 border-b-2 border-gray-200 bg-gray-50 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Artist</th>
                             <th class="px-5 py-3 border-b-2 border-gray-200 bg-gray-50 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Album</th>
                             <th class="px-5 py-3 border-b-2 border-gray-200 bg-gray-50 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Original Artist</th>
+                            <th class="px-5 py-3 border-b-2 border-gray-200 bg-gray-50 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Genres</th>
                             <th class="px-5 py-3 border-b-2 border-gray-200 bg-gray-50 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Size</th>
                             <th class="px-5 py-3 border-b-2 border-gray-200 bg-gray-50 text-center text-xs font-semibold text-gray-600 uppercase tracking-wider">Actions</th>
                         </tr>
@@ -151,6 +159,14 @@ pub const HTML_CONTENT: &str = r#"
                                     {{ track.metadata.original_artist }}
                                 </span>
                                  <span v-else class="text-gray-400">-</span>
+                            </td>
+                              <td class="px-5 py-5 border-b border-gray-200 bg-white text-sm">
+                                <span v-if="track.metadata.genres && track.metadata.genres.length > 0">
+                                    <span v-for="(g, i) in track.metadata.genres" :key="i" class="inline-block bg-purple-100 text-purple-800 text-xs px-2 py-1 rounded mr-1 mb-1">
+                                        {{ g[0] }}
+                                    </span>
+                                </span>
+                                <span v-else class="text-gray-400">-</span>
                             </td>
                             <td class="px-5 py-5 border-b border-gray-200 bg-white text-sm">
                                 <p class="text-gray-900 whitespace-no-wrap">{{ formatBytes(track.file_size) }}</p>
@@ -317,6 +333,21 @@ pub const HTML_CONTENT: &str = r#"
                     }
                 };
 
+                const startClassify = async () => {
+                    try {
+                        const res = await fetch('/api/classify/start', { method: 'POST' });
+                        const data = await res.json();
+                        if (data.status === 'started') {
+                            isScanning.value = true;
+                            pollStatus();
+                        } else {
+                            alert('Failed to start classification: ' + (data.error || 'Unknown error'));
+                        }
+                    } catch (e) {
+                        alert('Error starting classification: ' + e);
+                    }
+                };
+
                 const pollStatus = async () => {
                     const timer = setInterval(async () => {
                         try {
@@ -432,7 +463,9 @@ pub const HTML_CONTENT: &str = r#"
                     uniqueArtists,
                     formatBytes,
                     formatTime,
+                    formatTime,
                     startScan,
+                    startClassify,
                     findSimilar,
                     showRecommendModal,
                     recommendLoading,

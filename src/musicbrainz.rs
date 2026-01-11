@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MBRecordingResponse {
     pub id: String,
     pub title: String,
@@ -11,26 +11,26 @@ pub struct MBRecordingResponse {
     pub relations: Option<Vec<Relation>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ArtistCredit {
     pub name: String,
     pub artist: Option<MBArtist>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MBArtist {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Relation {
     #[serde(rename = "type")]
     pub rel_type: String, // e.g., "performance"
     pub work: Option<MBWork>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MBWork {
     pub id: String,
     pub title: String,
@@ -38,14 +38,14 @@ pub struct MBWork {
 }
 
 // Struct for Work lookup response which contains recordings
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MBWorkResponse {
     pub id: String,
     pub title: String,
     pub relations: Option<Vec<WorkRelation>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct WorkRelation {
     #[serde(rename = "type")]
     pub rel_type: String,
@@ -53,7 +53,7 @@ pub struct WorkRelation {
     pub begin: Option<String>, // Date, e.g. "1988-01-01"
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MBRecordingMinimal {
     pub id: String,
     pub title: String,

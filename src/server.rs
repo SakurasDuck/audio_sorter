@@ -16,30 +16,26 @@ use crate::html_template::HTML_CONTENT;
 use crate::scan_manager::ScanManager;
 use crate::storage::{AudioLibrary, IndexedTrack};
 
-fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return f32::NAN;
-    }
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f32>()
-        .sqrt()
-}
-
 struct AppState {
     index_path: PathBuf,
     input_dir: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
     scan_manager: Arc<ScanManager>,
 }
 
-pub async fn start_server(index_dir: PathBuf, input_dir: Option<PathBuf>, port: u16) {
+pub async fn start_server(
+    index_dir: PathBuf,
+    input_dir: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+    port: u16,
+) {
     let index_path = index_dir.join("index.json");
     let scan_manager = Arc::new(ScanManager::new());
 
     let state = Arc::new(AppState {
         index_path,
         input_dir: input_dir.clone(),
+        model_dir: model_dir.clone(),
         scan_manager,
     });
 
@@ -47,6 +43,7 @@ pub async fn start_server(index_dir: PathBuf, input_dir: Option<PathBuf>, port: 
         .route("/", get(serve_index))
         .route("/api/tracks", get(serve_tracks))
         .route("/api/scan/start", post(start_scan))
+        .route("/api/classify/start", post(start_classify))
         .route("/api/scan/status", get(get_scan_status))
         .route("/api/duplicates", get(get_duplicates))
         .route("/api/recommend", get(get_recommendations))
@@ -68,7 +65,34 @@ pub async fn start_server(index_dir: PathBuf, input_dir: Option<PathBuf>, port: 
     );
 
     let listener = TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 async fn get_playlist(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
@@ -185,6 +209,27 @@ async fn start_scan(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+async fn start_classify(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let input_dir = match &state.input_dir {
+        Some(d) => d.clone(),
+        None => return Json(json!({"error": "No input directory configured"})),
+    };
+
+    let Some(model_dir) = &state.model_dir else {
+        return Json(json!({"error": "No model directory configured"}));
+    };
+
+    let index_dir = state.index_path.parent().unwrap().to_path_buf();
+
+    match state
+        .scan_manager
+        .start_classify(index_dir, model_dir.clone())
+    {
+        Ok(_) => Json(json!({"status": "started"})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 async fn get_scan_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let progress = state.scan_manager.get_progress();
     Json(progress)
@@ -200,6 +245,14 @@ async fn get_duplicates(State(state): State<Arc<AppState>>) -> Json<Vec<Vec<Inde
 #[derive(serde::Deserialize)]
 struct RecommendParams {
     path: String,
+    /// Filter: only include tracks by this artist
+    same_artist: Option<String>,
+    /// Filter: only include tracks from this album
+    same_album: Option<String>,
+    /// Filter: exclude tracks from this album
+    exclude_album: Option<String>,
+    /// Number of results (default 20)
+    limit: Option<usize>,
 }
 
 async fn get_recommendations(
@@ -207,7 +260,6 @@ async fn get_recommendations(
     Query(params): extract::Query<RecommendParams>,
 ) -> impl IntoResponse {
     let target_path = PathBuf::from(&params.path);
-    // analysis.bin is sibling of index.json
     let analysis_path = state.index_path.parent().unwrap().join("analysis.bin");
 
     let store = match crate::analysis_store::AnalysisStore::load(&analysis_path) {
@@ -215,56 +267,38 @@ async fn get_recommendations(
         Err(_) => return Json(json!({"error": "Failed to load analysis store"})),
     };
 
-    let target_analysis = match store.get(&target_path) {
-        Some(a) => a,
-        None => return Json(json!({"error": "Target song has no analysis data"})),
-    };
-
-    let mut results = Vec::new();
-
-    for (path, analysis) in &store.data {
-        if path == &target_path {
-            continue;
-        }
-
-        let distance = euclidean_distance(target_analysis, analysis);
-        if distance.is_nan() {
-            continue;
-        }
-        results.push((path, distance));
-    }
-
-    // Sort by distance ASC
-    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Top 20
-    let top_results: Vec<_> = results.into_iter().take(20).collect();
-
-    // Enrich
     let library = match AudioLibrary::load(&state.index_path) {
         Ok(lib) => lib,
-        Err(_) => AudioLibrary::default(),
+        Err(_) => return Json(json!({"error": "Failed to load library"})),
     };
 
-    let enriched: Vec<_> = top_results
+    // Get the target track's fingerprint to exclude exact duplicates
+    let exclude_fp = library
+        .files
+        .get(&target_path)
+        .and_then(|t| t.metadata.fingerprint.clone());
+
+    // Build filters from query params
+    let filters = crate::recommend::RecommendFilters {
+        same_artist: params.same_artist,
+        same_album: params.same_album,
+        exclude_album: params.exclude_album,
+        exclude_fingerprint: exclude_fp,
+        genre: None,
+    };
+
+    let top_k = params.limit.unwrap_or(20);
+    let results = crate::recommend::find_similar(&target_path, &library, &store, &filters, top_k);
+
+    let enriched: Vec<_> = results
         .iter()
-        .map(|(path, dist)| {
-            let track = library.files.get(*path);
-            let title = track
-                .map(|t| t.metadata.title.clone())
-                .unwrap_or_else(|| "Unknown".to_string());
-            let artist = track
-                .map(|t| t.metadata.artist.clone())
-                .unwrap_or_else(|| "Unknown".to_string());
-            let album = track
-                .and_then(|t| t.metadata.album.clone())
-                .unwrap_or_else(|| "-".to_string());
+        .map(|scored| {
             json!({
-                "path": path.to_string_lossy(),
-                "title": title,
-                "artist": artist,
-                "album": album,
-                "distance": dist
+                "path": scored.track.path.to_string_lossy(),
+                "title": scored.track.metadata.title,
+                "artist": scored.track.metadata.artist,
+                "album": scored.track.metadata.album.clone().unwrap_or_else(|| "-".to_string()),
+                "distance": scored.distance
             })
         })
         .collect();

@@ -7,10 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod acoustid;
 pub mod analysis_store;
 pub mod audio_decoder;
+pub mod cache;
 pub mod fingerprint;
+pub mod genre_classifier;
 pub mod html_template;
 pub mod musicbrainz;
 pub mod organizer;
+pub mod recommend;
 pub mod scan_manager;
 pub mod scanner;
 pub mod server;
@@ -33,6 +36,8 @@ enum Commands {
     Scan(ScanArgs),
     /// Start web dashboard
     Serve(ServeArgs),
+    /// Run genre classification
+    Classify(ClassifyArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -55,6 +60,17 @@ pub struct ScanArgs {
 }
 
 #[derive(Parser, Debug)]
+pub struct ClassifyArgs {
+    /// Directory containing index data (index.json) where library is stored
+    #[arg(short, long)]
+    index_dir: PathBuf,
+
+    /// Directory containing ONNX models (optional, defaults to assets/models)
+    #[arg(short, long)]
+    model_dir: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
 struct ServeArgs {
     /// Directory containing index data (index.json)
     #[arg(long)]
@@ -67,6 +83,10 @@ struct ServeArgs {
     /// Input directory to scan (required for web-based scanning)
     #[arg(long)]
     input_dir: Option<PathBuf>,
+
+    /// Directory containing ONNX models (optional)
+    #[arg(long)]
+    model_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -77,11 +97,55 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Scan(args) => run_scan(args).await,
         Commands::Serve(args) => run_serve(args).await,
+        Commands::Classify(args) => run_classify(args).await,
     }
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
-    server::start_server(args.index_dir, args.input_dir, args.port).await;
+    server::start_server(args.index_dir, args.input_dir, args.model_dir, args.port).await;
+    Ok(())
+}
+
+async fn run_classify(args: ClassifyArgs) -> Result<()> {
+    let model_dir = args
+        .model_dir
+        .unwrap_or_else(|| PathBuf::from("assets/models"));
+
+    if !model_dir.exists() {
+        eprintln!("Error: Model directory {:?} does not exist.", model_dir);
+        return Ok(());
+    }
+
+    let manager = scan_manager::ScanManager::new();
+    println!("Starting genre classification...");
+    println!("Index: {:?}", args.index_dir);
+    println!("Models: {:?}", model_dir);
+
+    manager.start_classify(args.index_dir, model_dir)?;
+
+    // Poll for completion
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let p = manager.get_progress();
+
+        if !p.is_scanning {
+            if p.errors > 0 {
+                println!("Finished with {} errors.", p.errors);
+            } else {
+                println!("Finished successfully.");
+            }
+            break;
+        }
+        print!(
+            "\rProcessed: {} files... (CPU: {:.1}%, MEM: {} MB)",
+            p.files_processed,
+            p.resources.cpu_usage,
+            p.resources.memory_usage / 1024 / 1024
+        );
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+    }
+    println!();
     Ok(())
 }
 
@@ -193,13 +257,10 @@ async fn run_scan(args: ScanArgs) -> Result<()> {
     let processed_results: Vec<(PathBuf, u64, u64, Result<(TrackMetadata, Option<Vec<f32>>)>)> =
         files_to_process
             .par_iter()
-            .map_init(
-                || reqwest::blocking::Client::new(),
-                |client, (path, size, mtime)| {
-                    let result = worker::process_file(path, &args, client);
-                    (path.clone(), *size, *mtime, result)
-                },
-            )
+            .map(|(path, size, mtime)| {
+                let result = worker::process_file(path, &args);
+                (path.clone(), *size, *mtime, result)
+            })
             .collect();
 
     // 5. Merge Phase

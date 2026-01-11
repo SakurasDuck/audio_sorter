@@ -25,6 +25,16 @@ sysinfo = "0.30"
 dashmap = "5.5"
 tokio-stream = "0.1"
 urlencoding = "2.1"
+lru = "0.12"
+# ONNX Runtime for genre classification
+ort = { version = "=2.0.0-rc.11", features = ["load-dynamic", "ndarray"], optional = true }
+ndarray = { version = "0.15", optional = true }
+rubato = { version = "0.14", optional = true }
+rustfft = { version = "6.2", optional = true }
+
+[features]
+default = []
+genre-onnx = ["dep:ort", "dep:ndarray", "dep:rubato", "dep:rustfft"]
 
 [profile.release]
 opt-level = 3
